@@ -8,8 +8,10 @@ It requires ROS2 Jazzy (or maybe later) to build since we're using the GenericCl
 
 If you need to build the node for an older ROS2 version, you have to write your own GenericClient class which could probably be inspired of what is done in GenericService and in Jazzy's GenericClient class (see rclcpp/generic_client.hpp).
 
-It's currently only available for Windows systems because of the use of WinSock2 lib. The rest of the code is pretty much standard C++.
-It shall not be too difficult to adapt to use Posix sockets instead, since WinSock2 uses the same sockets paradigm.
+-- It's currently only available for Windows systems because of the use of WinSock2 lib. The rest of the code is pretty much standard C++.
+-- It shall not be too difficult to adapt to use Posix sockets instead, since WinSock2 uses the same sockets paradigm.
+
+Posix sockets instead ！
 
 ## Building
 
