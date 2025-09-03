@@ -11,7 +11,10 @@
 #include <mutex>
 #include <string>
 #include <cstdarg>
-#include <WinSock2.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <unistd.h>  // 包含close()
+
 
 class TcpServerNode : public rclcpp::Node {
 public:
@@ -41,7 +44,7 @@ private:
     std::string tcp_ip{};
     int tcp_port{0};
     int connections{0};
-    SOCKET tcp_server{INVALID_SOCKET};
+    int tcp_server = -1;
 
     bool stop_server_thread{ false };
     std::thread server_thread{};

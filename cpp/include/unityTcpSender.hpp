@@ -9,7 +9,7 @@
 #include <memory>
 #include <chrono>
 #include "statusEvent.hpp"
-#include <WinSock2.h>
+#include <sys/socket.h>
 #include "rosCommunication.hpp"
 #include "threadPauser.hpp"
 #include "sysCommands.hpp"
@@ -34,10 +34,10 @@ public:
 	RosData send_unity_service_request(const std::string& topic, const RosData& request);
     void send_unity_service_response(int srv_id, const RosData& data);
     void send_topic_list(const SysCommand::TopicsResponse &topics_response);
-	void start_sender(SOCKET socket, std::shared_ptr<StatusEvent>& event);
+	void start_sender(int socket, std::shared_ptr<StatusEvent>& event);
 
 private:
-	void sender_loop(SOCKET socket, std::shared_ptr<StatusEvent>& event);
+	void sender_loop(int socket, std::shared_ptr<StatusEvent>& event);
 	std::string serialize_message(const std::string& destination, const RosData& message);
 	std::string serialize_command(const std::string& command, const std::string& params);
 	void add_to_queue(const std::string &data, Reliability reliablity);

@@ -1,5 +1,7 @@
 #pragma once
-#include <WinSock2.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <memory>
 #include <string>
 #include <map>
@@ -16,7 +18,7 @@ class TcpServerNode;
 
 class ClientThread {
 public:
-	ClientThread(TcpServerNode *tcp_server, SOCKET socket, const sockaddr_in& remote);
+	ClientThread(TcpServerNode *tcp_server, int socket, const sockaddr_in& remote);
 
 	void start();
 	void halt();
@@ -51,7 +53,7 @@ private:
 
 	TcpServerNode* tcp_server{ nullptr };
 	UnityTcpSender unity_tcp_sender;
-	SOCKET socket;
+	int socket;
 	sockaddr_in remote;
 	std::thread thread;
 	std::shared_ptr<StatusEvent> halt_event;

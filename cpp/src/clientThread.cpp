@@ -7,7 +7,7 @@
 
 const std::string ClientThread::ROS2_HEADER { 0, 1, 0, 0 };
 
-ClientThread::ClientThread(TcpServerNode* tcp_server, SOCKET socket, const sockaddr_in &remote)
+ClientThread::ClientThread(TcpServerNode* tcp_server, int socket, const sockaddr_in &remote)
     : tcp_server(tcp_server), unity_tcp_sender(tcp_server), socket(socket), remote(remote) {
     try {
         parse_message_regex.assign(R"(<class '([^.]+)\.msg.*_([^_]+)'>)", std::regex_constants::ECMAScript | std::regex_constants::optimize);
@@ -41,8 +41,8 @@ void ClientThread::recvall(char *buffer, int size) {
     int pos = 0;
     while (pos < size) {
         int read = recv(socket, buffer + pos, size - pos, 0);
-        if (SOCKET_ERROR == read) {
-            tcp_server->log_error("recvall - Unable to read from socket: %d", WSAGetLastError());
+        if (-1 == read) {
+            tcp_server->log_error("recvall - Unable to read from socket");
             throw std::runtime_error{"socket error"};
         }
         pos += read;
@@ -57,6 +57,9 @@ int32_t ClientThread::read_int32() {
 
 std::string ClientThread::read_string() {
     int32_t str_len = read_int32();
+    if (str_len < 0) {
+        throw std::runtime_error("Invalid string length");
+    }
     std::string result{};
     if (str_len > 0) {
         result.resize(str_len);
@@ -73,8 +76,16 @@ std::pair<std::string, std::string> ClientThread::read_message() {
     /*  Decode destination and full message size from socket connection.
         Grab bytes in chunks until full message has been read.
         */
+
     std::string destination = read_string();
+    if (destination.empty()) {
+        //throw std::runtime_error("Invalid destination header");
+    }
+    
     int32_t full_message_size = read_int32();
+    if (full_message_size <= 0) {
+        //throw std::runtime_error("Invalid message size");
+    }
     std::string data{};
     if (full_message_size > 0) {
         data.resize(full_message_size);
@@ -86,7 +97,8 @@ std::pair<std::string, std::string> ClientThread::read_message() {
 void ClientThread::send_ros_service_request(int srv_id, const std::string& destination, const RosData &data) {
     const auto& ros_communicator_iter = ros_services_table.find(destination);
     if (ros_communicator_iter != ros_services_table.cend()) {
-        std::thread(&ClientThread::service_call_thread, this, srv_id, destination, data, ros_communicator_iter->second).detach();
+        auto func = std::bind(&ClientThread::service_call_thread, this, srv_id, destination, data, ros_communicator_iter->second);
+        std::thread(func).detach();
     }
 }
 
@@ -137,89 +149,120 @@ void ClientThread::run() {
     pending_srv_id = NO_PENDING_SERVICE_ID;
     pending_srv_is_request = false;
 
-    const auto& remote_addr = remote.sin_addr.S_un.S_un_b;
-    tcp_server->log_info("Connection from %hhu.%hhu.%hhu.%hhu:%hu", remote_addr.s_b1, remote_addr.s_b2, remote_addr.s_b3, remote_addr.s_b4, ntohs(remote.sin_port));
+    char ip_str[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &remote.sin_addr, ip_str, sizeof(ip_str));
+    tcp_server->log_info("Connection from %s:%hu", 
+                        ip_str, 
+                        ntohs(remote.sin_port));
     unity_tcp_sender.start_sender(socket, halt_event);
 
     try {
         RosData ros_data{};
         while (!halt_event->is_set()) {
             const auto [destination, data] = read_message();
-            if (!destination.empty()) { // ignore keepalive message (empty destination), listen for more
-                //tcp_server->log_debug("Received %d bytes for %s", data.size(), destination);
-                // Process this message that was sent from Unity
-                if (pending_srv_id != NO_PENDING_SERVICE_ID) {
-                    // if we've been told that the next message will be a service request/response, process it as such
+            tcp_server->log_info("Received message: dest=%s size=%d", 
+                        destination.c_str(), data.size());
+            // 增强数据校验
+            if (destination.empty() || data.empty()) {
+                //tcp_server->log_info("Skipping empty message");
+                continue;
+            }
+
+            if (pending_srv_id != NO_PENDING_SERVICE_ID) {
+                if (!get_ros_data(data, ros_data)) {
+                    throw std::invalid_argument(
+                        "Service data parse failed for: " + destination
+                    );
+                }
+                // ... 服务处理逻辑
+            } else if (destination.substr(0, 2) == "__") {
+                handle_syscommand(destination, data);
+            } else {
+                auto publisher = publishers_table.find(destination);
+                if (publisher != publishers_table.end()) {
                     if (!get_ros_data(data, ros_data)) {
-                        throw std::runtime_error{ "Invalid ros data, destination : " + destination };
-                    }
-                    if (pending_srv_is_request) {
-                        send_ros_service_request(pending_srv_id, destination, ros_data);
-                    } else {
-                        unity_tcp_sender.send_unity_service_response(pending_srv_id, ros_data);
-                    }
-                    pending_srv_id = NO_PENDING_SERVICE_ID;
-                } else if (destination.substr(0, 2) == "__") {
-                    // handle a system command, such as registering new topics
-                    handle_syscommand(destination, data);
-                } else {
-                    auto publisher = publishers_table.find(destination);
-                    if (publisher != publishers_table.end()) {
-                        if (get_ros_data(data, ros_data)) {
-                            publisher->second->send(ros_data);
-                        } else {
-                            std::string error_msg = "Invalid ros data, destination : " + destination;
-                            unity_tcp_sender.send_unity_error(error_msg);
-                            tcp_server->log_error(error_msg.c_str());
-                        }
-                    } else {
-                        std::ostringstream oss;
-                        oss << "Not registered to publish topic '" << destination << "'! Valid publish topics are:";
-                        for (const auto& iter : publishers_table) {
-                            oss << iter.first << ". ";
-                        }
-                        std::string error_msg = oss.str();
+                        std::string error_msg = "Topic data invalid: " + destination;
                         unity_tcp_sender.send_unity_error(error_msg);
-                        tcp_server->log_error(error_msg.c_str());
+                        tcp_server->log_info("%s", error_msg.c_str());
+                        continue; // 跳过当前迭代
                     }
+                    publisher->second->send(ros_data);
+                } else {
+                    // 改进的错误信息生成
+                    std::ostringstream oss;
+                    oss << "Topic not registered: " << destination << ". Available:";
+                    for (const auto& [topic, _] : publishers_table) {
+                        oss << " " << topic;
+                    }
+                    unity_tcp_sender.send_unity_error(oss.str());
+                    tcp_server->log_info("%s", oss.str().c_str());
                 }
             }
         }
-    } catch (std::exception ex) {
-        tcp_server->log_error("exception occured in ClientThread: %s", ex.what());
+    } catch (const std::system_error& ex) {
+        tcp_server->log_info("System error: %s", ex.what());
+    } catch (const std::exception& ex) {
+        tcp_server->log_info("ClientThread exception: %s", ex.what());
+        if (halt_event->is_set()) throw; // 重新抛出终止信号
+    } catch (...) {
+        tcp_server->log_info("Unknown exception caught");
     }
     halt_event->set();
-    closesocket(socket);
+    close(socket);
     unregister_all();
-    tcp_server->log_info("Disconnected from %hhu.%hhu.%hhu.%hhu:%hu", remote_addr.s_b1, remote_addr.s_b2, remote_addr.s_b3, remote_addr.s_b4, ntohs(remote.sin_port));
+
+    inet_ntop(AF_INET, &remote.sin_addr, ip_str, sizeof(ip_str));
+    tcp_server->log_info("Disconnected from %s:%hu", 
+                        ip_str,
+                        ntohs(remote.sin_port));
+
 
     run_is_finished = true;
 }
 
 void ClientThread::register_subscriber(const std::string& topic, const std::string& message_type) {
-    auto& old_node = subscribers_table.find(topic);
-    if (old_node != subscribers_table.end()) {
-        tcp_server->unregister_node(std::reinterpret_pointer_cast<RosNode>(old_node->second));
+    auto it = subscribers_table.find(topic);
+    if (it != subscribers_table.end()) {
+        tcp_server->unregister_node(std::reinterpret_pointer_cast<RosNode>(it->second));
     }
-    std::shared_ptr<RosSubscriber> new_subscriber = std::make_shared<RosSubscriber>(&unity_tcp_sender, topic, message_type);
+    
+    std::shared_ptr<RosSubscriber> new_subscriber = 
+        std::make_shared<RosSubscriber>(&unity_tcp_sender, topic, message_type);
+    
     subscribers_table[topic] = new_subscriber;
     tcp_server->register_node(std::reinterpret_pointer_cast<RosNode>(new_subscriber));
-    tcp_server->log_info("RegisterSubscriber(%s, %s)", topic.c_str(), message_type.c_str());
+    
+    tcp_server->log_info("RegisterSubscriber(%s, %s)", 
+                        topic.c_str(), 
+                        message_type.c_str());
 }
 
-void ClientThread::register_publisher(const std::string& topic, const std::string& message_type, int queue_size, bool latch) {
-    auto& old_node = publishers_table.find(topic);
-    if (old_node != publishers_table.end()) {
-        tcp_server->unregister_node(std::reinterpret_pointer_cast<RosNode>(old_node->second));
+
+
+void ClientThread::register_publisher(const std::string& topic, 
+                                     const std::string& message_type, 
+                                     int queue_size, 
+                                     bool latch) {
+    // 使用迭代器而非引用
+    auto it = publishers_table.find(topic);
+    if (it != publishers_table.end()) {
+        tcp_server->unregister_node(std::reinterpret_pointer_cast<RosNode>(it->second));
     }
-    std::shared_ptr<RosPublisher> new_publisher = std::make_shared<RosPublisher>(topic, message_type, queue_size);
+    
+    std::shared_ptr<RosPublisher> new_publisher = 
+        std::make_shared<RosPublisher>(topic, message_type, queue_size);
+    
     publishers_table[topic] = new_publisher;
     tcp_server->register_node(std::reinterpret_pointer_cast<RosNode>(new_publisher));
-    tcp_server->log_info("RegisterPublisher(%s, %s)", topic.c_str(), message_type.c_str());
+    
+    tcp_server->log_info("RegisterPublisher(%s, %s)", 
+                        topic.c_str(), 
+                        message_type.c_str());
 }
 
+
 void ClientThread::register_ros_service(const std::string& topic, const std::string& request_message_type) {
-    auto& old_node = ros_services_table.find(topic);
+    auto old_node = ros_services_table.find(topic);
     if (old_node != ros_services_table.end()) {
         tcp_server->unregister_node(std::reinterpret_pointer_cast<RosNode>(old_node->second));
     }
@@ -230,7 +273,7 @@ void ClientThread::register_ros_service(const std::string& topic, const std::str
 }
 
 void ClientThread::register_unity_service(const std::string& topic, const std::string& request_message_type) {
-    auto& old_node = unity_services_table.find(topic);
+    auto old_node = unity_services_table.find(topic);
     if (old_node != unity_services_table.end()) {
         tcp_server->unregister_node(std::reinterpret_pointer_cast<RosNode>(old_node->second));
     }

@@ -1,6 +1,4 @@
 #include "tcpServerNode.hpp"
-#include <WS2tcpip.h>
-#pragma comment(lib, "Ws2_32.lib")
 #include "clientThread.hpp"
 
 using namespace std::chrono_literals;
@@ -30,14 +28,6 @@ bool TcpServerNode::init(int connections, const std::string &tcp_ip, int tcp_por
     
     this->connections = connections;
 
-    // Initialize Winsock
-    WSADATA wsaData;
-    int iResult = WSAStartup(MAKEWORD(2, 2), &wsaData);
-    if (iResult != 0) {
-        RCUTILS_LOG_ERROR("WSAStartup failed: %d", iResult);
-        return false;
-    }
-
 	return true;
 }
 
@@ -54,7 +44,6 @@ void TcpServerNode::shutdown() {
         server_thread.join();
     }
     executor.reset();
-    WSACleanup();
 }
 
 void TcpServerNode::start() {
@@ -131,66 +120,81 @@ void TcpServerNode::listen_loop() {
     RCUTILS_LOG_INFO("Starting server on %s:%d", tcp_ip.c_str(), tcp_port);
 
     tcp_server = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (tcp_server == INVALID_SOCKET) {
-        RCUTILS_LOG_ERROR("Unable to create socket : %d", WSAGetLastError());
+    if (tcp_server == -1) {
+        RCUTILS_LOG_ERROR("Unable to create socket");
         return;
     }
-    DWORD reuse_addr = TRUE;
-    if (SOCKET_ERROR == setsockopt(tcp_server, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<char*>(&reuse_addr), sizeof(reuse_addr))) {
-        RCUTILS_LOG_ERROR("setsockopt failed : %d", WSAGetLastError());
-        closesocket(tcp_server);
-        tcp_server = INVALID_SOCKET;
+    int reuse_addr = 1;  // Linux使用int类型替代DWORD
+
+    if (setsockopt(tcp_server, SOL_SOCKET, SO_REUSEADDR, &reuse_addr, sizeof(reuse_addr)) == -1) {
+        perror("setsockopt failed");  // 使用标准错误输出
+        close(tcp_server);
+        tcp_server = -1;
         return;
     }
+
+#ifdef SO_REUSEPORT
+        setsockopt(tcp_server, SOL_SOCKET, SO_REUSEPORT, &reuse_addr, sizeof(reuse_addr));
+#endif
+
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     if (1 != inet_pton(AF_INET, tcp_ip.c_str(), &addr.sin_addr)) {
-        RCUTILS_LOG_ERROR("inet_pton failed with ip '%s' : %d", tcp_ip, WSAGetLastError());
-        closesocket(tcp_server);
-        tcp_server = INVALID_SOCKET;
-        return;
-    }
-    addr.sin_port = htons(tcp_port);
-    if (SOCKET_ERROR == bind(tcp_server, reinterpret_cast<sockaddr*>(&addr), sizeof(addr))) {
-        RCUTILS_LOG_ERROR("bind failed : %d", WSAGetLastError());
-        closesocket(tcp_server);
-        tcp_server = INVALID_SOCKET;
+        RCUTILS_LOG_ERROR("inet_pton failed with ip '%s'", tcp_ip);
+        close(tcp_server);
+        tcp_server = -1;
         return;
     }
 
+    addr.sin_port = htons(tcp_port);
+    if (bind(tcp_server, (sockaddr*)&addr, sizeof(addr)) == -1) {
+        if (errno == EADDRINUSE) {
+            RCUTILS_LOG_WARN("Port %d in use, waiting...", tcp_port);
+            sleep(1); // 指数退避重试
+            listen_loop();
+        } else {
+            RCUTILS_LOG_ERROR("Bind failed: %s", strerror(errno));
+        }
+    }
+
     while (!stop_server_thread) {
-        if (SOCKET_ERROR == listen(tcp_server, connections)) {
-            RCUTILS_LOG_ERROR("listen failed : %d", WSAGetLastError());
-            closesocket(tcp_server);
-            tcp_server = INVALID_SOCKET;
+        if (-1 == listen(tcp_server, connections)) {
+            RCUTILS_LOG_ERROR("listen failed");
+            close(tcp_server);
+            tcp_server = -1;
             return;
         }
 
         sockaddr_in client_addr{};
-        int client_addr_len = sizeof(client_addr);
-        SOCKET client_socket = accept(tcp_server, reinterpret_cast<sockaddr*>(&client_addr), &client_addr_len);
-        if (client_socket == INVALID_SOCKET) {
-            RCUTILS_LOG_ERROR("unable to accept incoming connection request : %d", WSAGetLastError());
+        socklen_t client_addr_len = sizeof(client_addr);  // 使用标准类型
+        int client_socket = accept(tcp_server, 
+                                (struct sockaddr*)&client_addr, 
+                                &client_addr_len);
+
+        if (client_socket == -1) {
+            RCUTILS_LOG_ERROR("unable to accept incoming connection request");
         } else {
-            std::shared_ptr<ClientThread> clientThread = std::make_shared<ClientThread>(this, client_socket, client_addr);
+            std::shared_ptr<ClientThread> client_thread = std::make_shared<ClientThread>(this, client_socket, client_addr);
             {
                 const std::lock_guard<std::mutex> clients_lock(client_threads_mutex);
-                // remove finished threads
-                for (auto& iter = client_threads.begin(); iter != client_threads.end(); iter++) {
+                for (auto iter = client_threads.begin(); iter != client_threads.end(); ) {
                     if ((*iter)->is_finished()) {
                         (*iter)->wait();
                         iter = client_threads.erase(iter);
+                    } else {
+                        ++iter;
                     }
                 }
-                client_threads.insert(clientThread);
+                client_threads.insert(client_thread);  // 使用修正后的变量名
             }
-            clientThread->start();
+            client_thread->start();
+
         }
     }
 
-    closesocket(tcp_server);
-    tcp_server = INVALID_SOCKET;
+    close(tcp_server);
+    tcp_server = -1;
 }
 
 
